@@ -13,6 +13,7 @@ If you're here because `--kv-cache-dtype nvfp4` explodes on your RTX 50xx / GB10
 | Prefix caching, 106K repeat | ✅ 72.5s → 6.8s (10.7×) |
 | Greedy determinism (4× identical) | ✅ byte-identical |
 | Tool calls (auto / required / follow-up / plain) | ✅ 4/4 with `--tool-call-parser qwen3_coder` |
+| Vision (multimodal image QA, tower loaded) | ✅ reads rendered text, 12s first request |
 
 ### Single-stream decode (temp=0, 200-token probes)
 | Config | count | recall | list | creative | KV pool |
@@ -22,20 +23,23 @@ If you're here because `--kv-cache-dtype nvfp4` explodes on your RTX 50xx / GB10
 | + MTP K=2 | 75.6 | 74.6 | 60.1 | 55.1 | 281,538 |
 | + MTP K=3 | **93.7** | **90.2** | 66.1 | 56.8 | 269,117 |
 | fp8_e4m3 KV (no MTP) | — | — | — | — | 209,465 |
+| vision tower + nvfp4 (no MTP) | — | — | — | — | 225,000 |
 
 Accept length scales 2.00 → 3.00 → 4.00 with K; MTP gain tracks content predictability (low-entropy text scales almost linearly, creative saturates by K=2). All numbers vs. an SGLang 0.5.21 baseline on the same box: engines match within ±1.3% without MTP.
 
-## Required launch flags (two real traps found in testing)
+## Required launch flags (three real traps found in testing)
 
 ```bash
 vllm serve <nvfp4-model> --kv-cache-dtype nvfp4 \
   --kernel-config '{"enable_flashinfer_autotune": false}' \
-  --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3}' \
+  --disable-custom-all-reduce \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --max-model-len 150000   # see KV budget note
 ```
 
 1. **`--kernel-config '{"enable_flashinfer_autotune": false}'` is mandatory for MTP + nvfp4 KV.** With FlashInfer autotune enabled, its benchmarking can land inside CUDA graph capture → `CUDA error: operation not permitted when stream is capturing` at startup. Non-deterministic (timing-dependent): K=1 booted once out of three tries. Disabling it uses the cached-tactic path and booted 4/4 green afterwards. Worth an upstream fix (defer autotune out of capture).
-2. **KV budget with MTP + parsers.** MTP draft weights + `--tool-call-parser`/`--reasoning-parser` squeeze the KV pool; at `--max-model-len 196000` startup was rejected (`3.42 GiB KV needed > 2.78 GiB available`). Either lower max-model-len (~150K) or raise `--gpu-memory-utilization`. Note `qwen3_5_mtp` method name is deprecated → use `mtp` on newer vLLM.
+2. **`--disable-custom-all-reduce` on non-standard multi-GPU topologies.** vLLM enables its custom all-reduce by default (`Using ['CUSTOM', 'PYNCCL']`). On this box (PCIe ACS override enabled, patched open GPU kernel modules for consumer P2P), TP workers died *silently mid-inference* — the failure surface is wild peer writes through CUDA IPC on a topology the custom AR assumes is stock. Downstream symptoms look nothing like a comms bug (random heap corruption / interpreter segfaults in unrelated components). Same root cause independently confirmed on the SGLang side of this box (`--disable-custom-all-reduce` is mandatory there too; NCCL P2P path is stable). Cost is ~nil on 16G consumer cards; measured NCCL(P2P+PHB) was even slightly faster than custom AR.
+3. **KV budget with MTP + parsers.** MTP draft weights + `--tool-call-parser`/`--reasoning-parser` squeeze the KV pool; at `--max-model-len 196000` startup was rejected (`3.42 GiB KV needed > 2.78 GiB available`). Either lower max-model-len (~150K) or raise `--gpu-memory-utilization`. Note `qwen3_5_mtp` method name is deprecated → use `mtp` on newer vLLM.
 
 ## Building from this branch (source build gotchas, all hit personally)
 
@@ -49,11 +53,12 @@ vllm serve <nvfp4-model> --kv-cache-dtype nvfp4 \
 ## Known engine-level issues seen during testing (possibly box-specific)
 - `fp8_e4m3` KV + torch.compile: worker crashed with an interpreter segfault 3/3 tries; `--enforce-eager` boots. NVFP4 KV never hit this.
 - `fp8_e5m2` KV is rejected for fp8 checkpoints by design (clear error).
-- Early-startup random `free(): invalid size` / tokenizer-pyo3 segfaults occurred a few times on this box regardless of config — a retry booted fine. This box also needed a full reboot mid-campaign (kernel-level environment poisoning killed Triton's LLVM backend; see notes on glibc shadow stack interactions).
+- Early-startup random `free(): invalid size` / tokenizer-pyo3 segfaults occurred a few times on this box regardless of config — a retry booted fine. Post-mortem attributes most of this family to the custom-AR/topology issue above (flag 2), not to JIT.
 - When TP workers die they may leak their VRAM under renamed process titles — `nvidia-smi` PID-based kill before each boot avoids phantom `NCCL error: unhandled cuda error`.
+- Vision + MTP combined: not yet re-tested with `--disable-custom-all-reduce`; the single observed crash predates the root-cause finding. The drafter code path explicitly whitelists `Qwen3_5ForConditionalGeneration`, so expect it to work.
 
 ## Not tested / out of scope
-- Vision tower (`--language-model-only` was used throughout; multimodal NVFP4 KV untested here)
+- Vision + MTP under the safe flag list above
 - GB10 / sm_121 (upstream issue #49011 reports green)
 - Long run soak (>1h sustained mixed load)
 
