@@ -24,6 +24,7 @@ If you're here because `--kv-cache-dtype nvfp4` explodes on your RTX 50xx / GB10
 | + MTP K=3 | **93.7** | **90.2** | 66.1 | 56.8 | 269,117 |
 | fp8_e4m3 KV (no MTP) | — | — | — | — | 209,465 |
 | vision tower + nvfp4 (no MTP) | — | — | — | — | 225,000 |
+| vision + MTP K=1 (`--no-mm-device-do-normalize`, max-len 120K) | 52.7 | 52.2 | 48.1 | 45.6 | 159,230 |
 
 Accept length scales 2.00 → 3.00 → 4.00 with K; MTP gain tracks content predictability (low-entropy text scales almost linearly, creative saturates by K=2). All numbers vs. an SGLang 0.5.21 baseline on the same box: engines match within ±1.3% without MTP.
 
@@ -33,6 +34,7 @@ Accept length scales 2.00 → 3.00 → 4.00 with K; MTP gain tracks content pred
 vllm serve <nvfp4-model> --kv-cache-dtype nvfp4 \
   --kernel-config '{"enable_flashinfer_autotune": false}' \
   --disable-custom-all-reduce \
+  --no-mm-device-do-normalize \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --max-model-len 150000   # see KV budget note
 ```
@@ -40,6 +42,7 @@ vllm serve <nvfp4-model> --kv-cache-dtype nvfp4 \
 1. **`--kernel-config '{"enable_flashinfer_autotune": false}'` is mandatory for MTP + nvfp4 KV.** With FlashInfer autotune enabled, its benchmarking can land inside CUDA graph capture → `CUDA error: operation not permitted when stream is capturing` at startup. Non-deterministic (timing-dependent): K=1 booted once out of three tries. Disabling it uses the cached-tactic path and booted 4/4 green afterwards. Worth an upstream fix (defer autotune out of capture).
 2. **`--disable-custom-all-reduce` on non-standard multi-GPU topologies.** vLLM enables its custom all-reduce by default (`Using ['CUSTOM', 'PYNCCL']`). On this box (PCIe ACS override enabled, patched open GPU kernel modules for consumer P2P), TP workers died *silently mid-inference* — the failure surface is wild peer writes through CUDA IPC on a topology the custom AR assumes is stock. Downstream symptoms look nothing like a comms bug (random heap corruption / interpreter segfaults in unrelated components). Same root cause independently confirmed on the SGLang side of this box (`--disable-custom-all-reduce` is mandatory there too; NCCL P2P path is stable). Cost is ~nil on 16G consumer cards; measured NCCL(P2P+PHB) was even slightly faster than custom AR.
 3. **KV budget with MTP + parsers.** MTP draft weights + `--tool-call-parser`/`--reasoning-parser` squeeze the KV pool; at `--max-model-len 196000` startup was rejected (`3.42 GiB KV needed > 2.78 GiB available`). Either lower max-model-len (~150K) or raise `--gpu-memory-utilization`. Note `qwen3_5_mtp` method name is deprecated → use `mtp` on newer vLLM.
+4. **`--no-mm-device-do-normalize` when serving vision + MTP together.** On Qwen3.5-VL style models, the GPU-side mm normalization path (`mm_device_do_normalize`, default-on) + MTP speculative decoding killed the engine on the *first image request* (worker signal-dies right where the MTP rejection/resample kernels cold-JIT; text-only requests stay healthy forever). Two deaths pre-fix, then 4/4 clean runs with the flag (2 vision rounds each, vision correct, decode 46–53 t/s at K=1 with tower loaded). `--enforce-eager` also avoids it but costs ~60% of decode throughput — the targeted flag is the fix. Reproduced 2/2, fixed 4/4 on sm_120/TP2; looks arch-independent and worth an upstream look.
 
 ## Building from this branch (source build gotchas, all hit personally)
 
